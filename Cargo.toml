@@ -3,7 +3,9 @@ name = "operator-in-the-loop"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[dependencies.pyo3]
+version = "0.25.0"
+features = ["auto-initialize"]
 
 [[bin]]
 name = "operator-in-the-loop"

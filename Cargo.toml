@@ -1,0 +1,10 @@
+[package]
+name = "operator-in-the-loop"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[[bin]]
+name = "operator-in-the-loop"
+path = "main.rs"

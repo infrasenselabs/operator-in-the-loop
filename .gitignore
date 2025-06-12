@@ -1,0 +1,7 @@
+# EPANET
+*temp.bin
+*temp.inp
+*temp.rpt
+
+# Excel temporary files
+~$*.xls*

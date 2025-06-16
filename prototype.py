@@ -23,6 +23,9 @@ simulation_results = simulator.run_sim()
 # TODO: replace with live sensor data. for now i'll either use Bradley's data
 # (as i am now) or stochastic data (this may lend itself to writing tests).
 
+# TODO: in writing tests i realized it's kind of awkward to have a list of 
+# `SensorReading` rather than a `DataFrame`.
+
 @dataclass
 class SensorReading:
     datetime: dt.datetime
@@ -58,7 +61,7 @@ def scale_demands(
     relative demand of each WWMD according to live sensors.
 
     :param model_demand_table: A table describing the modelled demand for each
-    EPANET node for each timestep.
+    EPANET node. Indexed by timesteps.
     :param flow_map: A map of in/outflow `BWFL_IDs` for WWMDs. Likely decoded
     from JSON.
     :param flow_readings: A list of field sensor readings to use to scale model
@@ -72,7 +75,7 @@ def scale_demands(
 
     scaled_demands = pd.DataFrame(
         data = [],
-        index = simulation_results.node['demand'].index
+        index = model_demand_table.index
     )
 
     for wwmd_id, flows in flow_map.items():
@@ -115,12 +118,13 @@ def scale_demands(
         sensor_demands_wwmd = flow_in.sub(flow_out, fill_value = 0)
         # the demand of the current WWMD according to model data.
         model_demand_table_wwmd = model_demand_table[epanet_node_ids]
-        # scaling factor is division of WWMD demand by the modelled demand.
+        # scaling factor is division of WWMD demand by the total modelled 
+        # demand.
         # note we only take the slice of `sensor_demands` that correspond to
         # `model_demands` as the time horizons may be different. but we assume
         # timesteps are at the same cadence and start times align.
         # TODO: handle division by 0
-        scaling_factors = sensor_demands_wwmd.array[:len(model_demand_table_wwmd)] / model_demand_table_wwmd.sum(axis = 1)
+        scaling_factors = sensor_demands_wwmd.array[:len(model_demand_table_wwmd)] / model_demand_table_wwmd.sum(axis = 'columns')
         scaled_demands = scaled_demands.join(
             model_demand_table_wwmd.mul(scaling_factors, axis = 'index')
         )

@@ -9,6 +9,10 @@ import wntr
 
 # assumptions:
 # - WWMD resolution is apppopriate (this is more granular than the DMA)
+# - if the time horizon of sensor data is longer than the model, we slice the
+#   sensor data so they align. instead, we could explore taking an average, 
+#   statistical analysis of the distribution of sensor data, etc. We should also 
+#   handle if sensor data time horizon is less than the model.
 
 network_path = Path("data/network/BWFLnet_2023_04.inp")
 model = wntr.network.WaterNetworkModel(network_path)
@@ -25,6 +29,8 @@ simulation_results = simulator.run_sim()
 
 # TODO: in writing tests i realized it's kind of awkward to have a list of 
 # `SensorReading` rather than a `DataFrame`.
+
+# TODO: consider calibration coefficients from Bradley's implementation.
 
 @dataclass
 class SensorReading:
@@ -58,14 +64,17 @@ def scale_demands(
 ) -> pd.DataFrame:
     
     """Scales modeled demand for each modelled timestamp according to the 
-    relative demand of each WWMD according to live sensors.
+    relative demand of each WWMD according to live sensors. Sensor data is 
+    sliced match the time horizion of model data.
 
     :param model_demand_table: A table describing the modelled demand for each
-    EPANET node. Indexed by timesteps.
+    EPANET node. Indexed by timesteps. Start time, timestep cadence, and flow 
+    units shoud align with `flow_readings`.
     :param flow_map: A map of in/outflow `BWFL_IDs` for WWMDs. Likely decoded
     from JSON.
     :param flow_readings: A list of field sensor readings to use to scale model
-    demand. Start time, timestep cadence, and flow units shoud align with ?.
+    demand. Start time, timestep cadence, and flow units shoud align with 
+    `model_demand_table`.
     :param epanet_id_lookup_table: A table describing the `WWMD_ID`s for each
     EPANET node ID. Note there tend to multiple EPANET nodes in a given WWMD.
 
@@ -135,9 +144,6 @@ def scale_demands(
 
     # note some of the modelled demands are 0 (e.g., `node_0004`)
     return scaled_demands
-    # TODO: i'm surprised resevoirs (`node_2859`, `node_2860`) actually have 
-    # demand -- is this the downstream pipe? note Bradley removed them in his
-    # impl.
 
 def load_sensor_readings(path: Path) -> List[SensorReading]:
         # produces a list of dictionaries mapping property/column name to value 
@@ -145,16 +151,11 @@ def load_sensor_readings(path: Path) -> List[SensorReading]:
         dictionaries = pd.read_csv(
             path,
             parse_dates = True
-        ).to_dict(
-            orient = "records"
-        )
+        ).to_dict(orient = "records")
         return [SensorReading(**dictionary) for dictionary in dictionaries]
 
-# pressure_data_path = Path("data/sample_field_data/pressure.csv")
+# flow sensor demand data is in m^3/s and time horizon is a week.
 flow_data_path = Path("data/sample_field_data/flow.csv")
-
-# it looks like the {WWMID: "Int, Int"} instances are behaving correctly.
-# pressure_readings = load_sensor_readings(pressure_data_path)
 flow_readings = load_sensor_readings(flow_data_path)
 
 flow_map_path = Path("data/network/flow_balance_wwmd.json")
@@ -172,16 +173,18 @@ epanet_id_lookup_table = pd.read_excel(
     dtype={'WWMD ID': str}
 )
 
-model_demand_table = simulation_results.node['demand']
-
-# demand is in m^3/s.
-# whilst the series are at the same resolution, they don't span the
-# same period:
-#     - model spans a day (96 entries).
-#     - sensor data spans a week.
-#
-# TODO: i believe Bradley skips the initial state (c.f. 
-# optimal-prv-contro.py:135) -- do i need to worry about that?
+# model demand is in m^3/s and time horizon is a day.
+# EPANET models the outflow of reservoir nodes to the adjacent link as demand 
+# (confirmed by analysing model in EPANET app). here we only care about
+# consumer demand so we'll remove the reservoir nodes.
+model_demand_table = simulation_results.node['demand'].drop(
+    model.reservoir_name_list,
+    axis = 'columns'
+)
+reservoir_indexes = epanet_id_lookup_table[
+    epanet_id_lookup_table["EPANET Node ID"].isin(model.reservoir_name_list)
+].index
+epanet_id_lookup_table = epanet_id_lookup_table.drop(reservoir_indexes)
 
 scale_demands(
     model_demand_table, 

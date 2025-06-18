@@ -28,7 +28,8 @@ simulation_results = simulator.run_sim()
 # (as i am now) or stochastic data (this may lend itself to writing tests).
 
 # TODO: in writing tests i realized it's kind of awkward to have a list of 
-# `SensorReading` rather than a `DataFrame`.
+# `SensorReading` rather than a `DataFrame`. it also would be useful to better
+# protect against model and sensor data have different time cadences.
 
 # TODO: consider calibration coefficients from Bradley's implementation.
 
@@ -47,6 +48,12 @@ class SensorReading:
         self.mean = self.mean if pd.notnull(self.mean) else None
         self.max = self.max if pd.notnull(self.max) else None
 
+@dataclass
+class OptimizationParameters:
+    h0: pd.Series
+
+    
+
 WWMD_ID = NewType('WWMD_ID', str)
 BWFL_ID = NewType('BWFL_ID', str)
 # TODO: update Python to 3.11+ and use StrEnum.
@@ -56,6 +63,7 @@ BWFL_ID = NewType('BWFL_ID', str)
 # TODO: update Python to 3.11+ and use StrEnum.
 FlowMap = Dict[WWMD_ID, Dict[str, List[BWFL_ID]]]
 
+# TODO: convert from flow to volume
 def scale_demands(
     model_demand_table: pd.DataFrame,
     flow_map: FlowMap, 
@@ -83,7 +91,7 @@ def scale_demands(
     """
 
     scaled_demands = pd.DataFrame(
-        data = [],
+        data = None,
         index = model_demand_table.index
     )
 
@@ -133,7 +141,10 @@ def scale_demands(
         # `model_demands` as the time horizons may be different. but we assume
         # timesteps are at the same cadence and start times align.
         # TODO: handle division by 0
-        scaling_factors = sensor_demands_wwmd.array[:len(model_demand_table_wwmd)] / model_demand_table_wwmd.sum(axis = 'columns')
+        scaling_factors = sensor_demands_wwmd.array[
+            :len(model_demand_table_wwmd)
+        ] / model_demand_table_wwmd.sum(axis = 'columns')
+
         scaled_demands = scaled_demands.join(
             model_demand_table_wwmd.mul(scaling_factors, axis = 'index')
         )
@@ -154,9 +165,81 @@ def load_sensor_readings(path: Path) -> List[SensorReading]:
         ).to_dict(orient = "records")
         return [SensorReading(**dictionary) for dictionary in dictionaries]
 
+def create_optimization_parameters(
+    pressure_readings: List[SensorReading],
+    epanet_id_lookup_table: pd.DataFrame
+) -> OptimizationParameters:
+    # some of these devices aren't in the WMWDs i'm looking at. as an 
+    # optimization i should probably remove those and any columnds in don't 
+    # need.
+    # does it make sense to do this for all sensor readings over the entire
+    # time horizon, or just the ones we use to scale?
+    # lookup table?
+    pressure_device_lookup_table_path = Path(
+        "data/devices/pressure_device_database.xlsx"
+    )
+    pressure_device_lookup_table = pd.read_excel(
+        pressure_device_lookup_table_path,
+        dtype = { 'Asset ID': str }
+    )
+
+    h0 = pd.DataFrame(
+        None,
+        index = range(model.num_reservoirs),
+        columns = list(set(reading.datetime for reading in pressure_readings))
+    )
+    for i, reservoir_model_name in enumerate(model.reservoir_name_list):
+        # is there a way to condense this into one line?
+        infoworks_node_id = epanet_id_lookup_table.loc[
+            epanet_id_lookup_table["EPANET Node ID"] == reservoir_model_name
+        ]["InfoWorks Node ID"].item()
+
+        # TODO: below i just grab first match as bradley does in 
+        # optimal-prv-control.py:118.
+        # looking at the data, i'm concerned this may cause us to select 
+        # inactive devices that don't correspond to the sensor reading time
+        # period.
+        
+        # `infoworks_node_id` is equivalent to Asset ID in the device table.
+        pressure_device_lookup_table_row = pressure_device_lookup_table.loc[
+            pressure_device_lookup_table["Asset ID"] == infoworks_node_id
+        ].to_numpy()[0]
+        pressure_device_lookup_table_row = pd.Series(
+            pressure_device_lookup_table_row,
+            index = pressure_device_lookup_table.columns
+        )
+
+        elevation_head = pressure_device_lookup_table_row["Final Elevation (m)"]
+
+        # `infoworks_node_id` is equivalent to Asset ID in the device table.
+        bwfl_id = pressure_device_lookup_table_row["BWFL ID"]
+
+        # TODO: use series
+        pressure_head = pd.DataFrame(
+            data = [
+                reading.__dict__
+                for reading in pressure_readings
+                if reading.bwfl_id == bwfl_id
+            ],
+            columns = ["datetime", "mean"]
+        ).set_index("datetime")
+
+        head = pressure_head + elevation_head
+        # TODO: is there a better way i can align the columns here since they 
+        # are equivalent timestamps?
+        h0.loc[i] = head["mean"]
+    
+    print(h0)
+    return OptimizationParameters(
+        h0 = h0
+    )
+
 # flow sensor demand data is in m^3/s and time horizon is a week.
 flow_data_path = Path("data/sample_field_data/flow.csv")
 flow_readings = load_sensor_readings(flow_data_path)
+
+pressure_data_path = Path("data/sample_field_data/pressure.csv")
+pressure_readings = load_sensor_readings(pressure_data_path)
 
 flow_map_path = Path("data/network/flow_balance_wwmd.json")
 # `flow_balance` maps nodes between WWMD regions to the nodes that flow
@@ -166,11 +249,13 @@ flow_map = json.load(
     open(flow_map_path)
 )
 
-epanet_id_lookup_table_path = Path("data/network/InfoWorks_to_EPANET_mapping.xlsx")
+epanet_id_lookup_table_path = Path(
+    "data/network/InfoWorks_to_EPANET_mapping.xlsx"
+)
 epanet_id_lookup_table = pd.read_excel(
     epanet_id_lookup_table_path,
     sheet_name = "Nodes",
-    dtype={'WWMD ID': str}
+    dtype = { 'WWMD ID': str }
 )
 
 # model demand is in m^3/s and time horizon is a day.
@@ -184,11 +269,15 @@ model_demand_table = simulation_results.node['demand'].drop(
 reservoir_indexes = epanet_id_lookup_table[
     epanet_id_lookup_table["EPANET Node ID"].isin(model.reservoir_name_list)
 ].index
-epanet_id_lookup_table = epanet_id_lookup_table.drop(reservoir_indexes)
 
 scale_demands(
     model_demand_table, 
     flow_map, 
     flow_readings, 
+    epanet_id_lookup_table.drop(reservoir_indexes)
+)
+
+create_optimization_parameters(
+    pressure_readings,
     epanet_id_lookup_table
 )

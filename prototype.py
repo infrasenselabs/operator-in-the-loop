@@ -364,7 +364,9 @@ def optimize(
     z: pd.Series, 
     d: pd.DataFrame,
     h0: pd.DataFrame,
-    A12: sp.csr_matrix
+    A12: sp.csr_matrix,
+    A10: sp.csr_matrix,
+    link_headloss_coefficients: NDArray[np.object_]
 ):
     
     # we consider the max. value of all of the reservoirs over all the 
@@ -396,7 +398,6 @@ def optimize(
     def valve_outlet_pressure_decision_variable_bounds(_, n, t):
         # for each valve, max. eta is difference of the start node max. head 
         # (outflow) and end node min. head (inflow)
-        # TODO: precompute for performance
         j = valve_indices[n]
         out_index = np.nonzero(A12[link, :] == -1).item()
         in_index = np.nonzero(A12[link, :] == 1).item()
@@ -433,6 +434,32 @@ def optimize(
         optimization_model.T,
         bounds = valve_outlet_pressure_decision_variable_bounds,
         initialize = 0
+    )
+
+    # TODO: add in epsilon.
+    def energy_conservation_constraint(model, j, t):
+        coefs = link_headloss_coefficients[j]
+        return (
+            coefs.R * model.q * (abs(model.q) ** (coefs.n_exp - 1))
+            + sum(A12[j, i] * model.h[i, t] for i in model.I)
+            + sum(A10[j, s] * h0[s, t] for s in model.S)
+            + sum(model.eta[n, t] for n in model.N if j in valve_indices)
+            == 0
+        )
+    
+    def mass_conservation_constraint(model, j, t):
+        return sum(A12[j, i] * model.q[j, t] for j in model.J) == d[i, t]
+    
+    model.energy_conservation = pyo.Constraint(
+        optimization_model.J,
+        optimization_model.T,
+        rule = energy_conservation_constraint
+    )
+
+    model.mass_conservation = pyo.Constraint(
+        optimization_model.I,
+        optimization_model.T,
+        rule = mass_conservation_constraint
     )
 
 

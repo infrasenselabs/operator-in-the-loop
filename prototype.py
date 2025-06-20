@@ -1,10 +1,11 @@
 from dataclasses import dataclass
 import datetime as dt
 from enum import Enum
+import json
 import math
 import numpy as np
 from numpy.typing import NDArray
-import json
+import pyomo.environ as pyo
 import pandas as pd
 from pathlib import Path
 import scipy.sparse as sp
@@ -42,6 +43,9 @@ simulation_results = simulator.run_sim()
 # TODO: install MyPy for type checking?
 
 # TODO: make sure i'm only using DataFrames/Series when it's actually useful.
+
+# TODO: why does Bradley use `valve_info.json` rather than getting valve info
+# from the model, do they differ?
 
 @dataclass
 class SensorReading:
@@ -281,7 +285,7 @@ def load_sensor_readings(path: Path) -> List[SensorReading]:
 def create_h0(
     pressure_readings: List[SensorReading],
     epanet_id_lookup_table: pd.DataFrame
-) -> pd.Series:
+) -> pd.DataFrame:
     # some of these devices aren't in the WMWDs i'm looking at. as an 
     # optimization i should probably remove those and any columnds in don't 
     # need.
@@ -351,6 +355,87 @@ def create_z(model: wntr.network.WaterNetworkModel) -> pd.Series:
         [junction.elevation for (_, junction) in model.junctions()]
     )
 
+
+# TODO: better type for `nt` a la index typealias?
+# todo: rename `model`` to `network_model`?
+def optimize(
+    model: wntr.network.WaterNetworkModel, 
+    nt: int, 
+    z: pd.Series, 
+    d: pd.DataFrame,
+    h0: pd.DataFrame,
+    A12: sp.csr_matrix
+):
+    
+    # we consider the max. value of all of the reservoirs over all the 
+    # timestamps the upper limit on junction head.
+    # TODO: wouldn't it be more precise to calculate the max per timestamp?
+    max_reservoir_head = np.max(h0)
+    def head_decision_variable_bounds(_, i, t):
+        elevation = z[i]
+        minimum_service_pressure = 0
+        # TODO: probably reshape demand df so its same orientation as other
+        # structs.
+        # TODO: should there be a threshold?
+        if d[t, i] <= 0:
+            # if there's no demand at the junction, we only need to maintain a
+            # 5m pressure head to avoid degradation of water quality.
+            minimum_service_pressure = 5
+        else:
+            # if there's is demand at the junction, we maintain a 15m pressure 
+            # head to meet demand.
+            minimum_service_pressure = 15
+        return (elevation + minimum_service_pressure, max_reservoir_head)
+
+    print(f"valve count: \{model.num_valves}")
+    valve_indices = [
+            i 
+            for i, (_, link) in enumerate(model.links()) 
+            if link.link_type == "valve"
+        ]
+    def valve_outlet_pressure_decision_variable_bounds(_, n, t):
+        # for each valve, max. eta is difference of the start node max. head 
+        # (outflow) and end node min. head (inflow)
+        # TODO: precompute for performance
+        j = valve_indices[n]
+        out_index = np.nonzero(A12[link, :] == -1).item()
+        in_index = np.nonzero(A12[link, :] == 1).item()
+        out_head_max =  head_decision_variable_bounds(_, out_index, t)[1]
+        in_head_min =  head_decision_variable_bounds(_, in_index, t)[0]
+        # TODO: shouldn't we apply the same logic to eta min?
+        return (0, out_head_max - in_head_min)
+
+    optimization_model = pyo.ConcreteModel()
+    # 0-indexed, per Bradley's implementation
+    # it also could be cool to
+    # to create an extension that indexes 0-index arrays with 1-index sets so the
+    # math is clearer here.
+    optimization_model.I = pyo.RangeSet(0, model.num_junctions - 1)
+    optimization_model.J = pyo.RangeSet(0, model.num_links - 1)
+    optimization_model.S = pyo.RangeSet(0, model.num_reservoirs - 1)
+    optimization_model.N = pyo.RangeSet(0, model.num_valves - 1)
+    optimization_model.T = pyo.RangeSet(0, nt - 1)
+    
+    optimization_model.h = pyo.Var(
+        optimization_model.I,
+        optimization_model.T,
+        bounds = head_decision_variable_bounds,
+        initialize = lambda _, i, t: h_0[i, t]
+    )
+    optimization_model.q = pyo.Var(
+        optimization_model.J,
+        optimization_model.T,
+        bounds = (-100, 100),
+        initialize = lambda _, j, t: q_0[j, t]
+    )
+    optimization_model.eta = pyo.Var(
+        optimization_model.N,
+        optimization_model.T,
+        bounds = valve_outlet_pressure_decision_variable_bounds,
+        initialize = 0
+    )
+
+
 # flow sensor demand data is in m^3/s and time horizon is a week.
 flow_data_path = Path("data/sample_field_data/flow.csv")
 flow_readings = load_sensor_readings(flow_data_path)
@@ -387,6 +472,9 @@ reservoir_indexes = epanet_id_lookup_table[
     epanet_id_lookup_table["EPANET Node ID"].isin(model.reservoir_name_list)
 ].index
 
+# TODO: use `nt` consistently throughout implementation.
+nt = model.options.time.duration / model.options.time.hydraulic_timestep
+
 d = scale_demands(
     model_demand_table, 
     flow_map, 
@@ -399,6 +487,7 @@ h0 = create_h0(
     epanet_id_lookup_table
 )
 
+# time horizon should match model: 1 day
 optimization_parameters = OptimizationParameters(
     h0 = h0,
     d = d
@@ -428,3 +517,7 @@ for i, (_, link) in enumerate(model.links()):
         model = model
     )
 print(link_headloss_coefficients)
+
+# TODO: store prev. info on OptimizationParameters struct
+
+# TODO: add AZP weights

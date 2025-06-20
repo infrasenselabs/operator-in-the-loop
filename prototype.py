@@ -379,7 +379,7 @@ def optimize(
         # TODO: probably reshape demand df so its same orientation as other
         # structs.
         # TODO: should there be a threshold?
-        if d[t, i] <= 0:
+        if d.iloc[t, i] <= 0:
             # if there's no demand at the junction, we only need to maintain a
             # 5m pressure head to avoid degradation of water quality.
             minimum_service_pressure = 5
@@ -391,16 +391,20 @@ def optimize(
 
     print(f"valve count: \{model.num_valves}")
     valve_indices = [
-            i 
-            for i, (_, link) in enumerate(model.links()) 
-            if link.link_type == "valve"
+            j
+            for j, (_, link) in enumerate(model.links()) 
+            # TODO: this check should match the assert.
+            if link.link_type == "Valve"
         ]
+    print(valve_indices)
     def valve_outlet_pressure_decision_variable_bounds(_, n, t):
         # for each valve, max. eta is difference of the start node max. head 
         # (outflow) and end node min. head (inflow)
         j = valve_indices[n]
-        out_index = np.nonzero(A12[link, :] == -1).item()
-        in_index = np.nonzero(A12[link, :] == 1).item()
+        # extract first element as `nonzero` returns a tuple of arrays 
+        # corresponding to each axis, even though our input is only 1D.
+        out_index = np.nonzero(A12[j, :] == -1)[0].item()
+        in_index = np.nonzero(A12[j, :] == 1)[0].item()
         out_head_max =  head_decision_variable_bounds(_, out_index, t)[1]
         in_head_min =  head_decision_variable_bounds(_, in_index, t)[0]
         # TODO: shouldn't we apply the same logic to eta min?
@@ -421,13 +425,13 @@ def optimize(
         optimization_model.I,
         optimization_model.T,
         bounds = head_decision_variable_bounds,
-        initialize = lambda _, i, t: h_0[i, t]
+        initialize = lambda _, i, t: h_0.iloc[t, i]
     )
     optimization_model.q = pyo.Var(
         optimization_model.J,
         optimization_model.T,
         bounds = (-100, 100),
-        initialize = lambda _, j, t: q_0[j, t]
+        initialize = lambda _, j, t: q_0.iloc[t, j]
     )
     optimization_model.eta = pyo.Var(
         optimization_model.N,
@@ -440,23 +444,23 @@ def optimize(
     def energy_conservation_constraint(model, j, t):
         coefs = link_headloss_coefficients[j]
         return (
-            coefs.R * model.q * (abs(model.q) ** (coefs.n_exp - 1))
+            coefs.R * model.q[j, t] * (abs(model.q[j, t]) ** (coefs.n_exp - 1))
             + sum(A12[j, i] * model.h[i, t] for i in model.I)
-            + sum(A10[j, s] * h0[s, t] for s in model.S)
+            + sum(A10[j, s] * h0.iloc[s, t] for s in model.S)
             + sum(model.eta[n, t] for n in model.N if j in valve_indices)
             == 0
         )
     
     def mass_conservation_constraint(model, j, t):
-        return sum(A12[j, i] * model.q[j, t] for j in model.J) == d[i, t]
+        return sum(A12[j, i] * model.q[j, t] for j in model.J) == d.iloc[i, t]
     
-    model.energy_conservation = pyo.Constraint(
+    optimization_model.energy_conservation = pyo.Constraint(
         optimization_model.J,
         optimization_model.T,
         rule = energy_conservation_constraint
     )
 
-    model.mass_conservation = pyo.Constraint(
+    optimization_model.mass_conservation = pyo.Constraint(
         optimization_model.I,
         optimization_model.T,
         rule = mass_conservation_constraint
@@ -469,7 +473,18 @@ def optimize(
             for t in model.T
         )
 
-    model.OBJ = pyo.Objective(rule = objective)
+    optimization_model.OBJ = pyo.Objective(rule = objective)
+
+    solver = pyo.SolverFactory('ipopt')
+    solver.options['tol'] = 1e-3
+    solver.options['max_iter'] = 1000
+    solver.options['print_level'] = 5
+    solver.options['mu_strategy'] = 'adaptive'
+    solver.options['mu_oracle'] = 'quality-function'
+    solver.options['warm_start_init_point'] = 'yes'
+
+    result = solver.solve(optimization_model, tee=True)
+    print(result)
 
 
 # flow sensor demand data is in m^3/s and time horizon is a week.
@@ -552,8 +567,19 @@ for i, (_, link) in enumerate(model.links()):
         link = link, 
         model = model
     )
-print(link_headloss_coefficients)
 
 # TODO: store prev. info on OptimizationParameters struct
 
 # TODO: add AZP weights
+
+# TODO: many warnings that vars are being set beyond their bounds
+optimize(
+    model = model, 
+    nt = nt, 
+    z = z, 
+    d = d, 
+    h0 = h0, 
+    A12 = incident_matrixes.A12, 
+    A10 = incident_matrixes.A10, 
+    link_headloss_coefficients = link_headloss_coefficients
+)

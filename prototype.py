@@ -281,6 +281,12 @@ def create_h0(
     
     return h0
 
+# elevations for each junction
+def create_z(model: wntr.network.WaterNetworkModel) -> pd.Series:
+    return pd.Series(
+        [junction.elevation for (_, junction) in model.junctions()]
+    )
+
 # flow sensor demand data is in m^3/s and time horizon is a week.
 flow_data_path = Path("data/sample_field_data/flow.csv")
 flow_readings = load_sensor_readings(flow_data_path)
@@ -338,3 +344,6 @@ print(optimization_parameters)
 
 incident_matrixes = IncidentMatrices.from_model(model = model)
 print(incident_matrixes)
+
+z = create_z(model = model)
+print(z)

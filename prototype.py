@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import datetime as dt
 from enum import Enum
+import math
 import numpy as np
 from numpy.typing import NDArray
 import json
@@ -39,6 +40,8 @@ simulation_results = simulator.run_sim()
 # TODO: more descriptive names for optimization parameters.
 
 # TODO: install MyPy for type checking?
+
+# TODO: make sure i'm only using DataFrames/Series when it's actually useful.
 
 @dataclass
 class SensorReading:
@@ -101,7 +104,68 @@ class IncidentMatrices:
             A12 = sp.csr_matrix(link_junction),
             A10 = sp.csr_matrix(link_reservoir)
         )
-    
+
+@dataclass
+class HeadlossCoefficients:
+    # Bradley calls this `K` but i'm sticking to the notation in the slides
+    R: float
+    n_exp: float
+
+    # TODO: use string enum
+    # i assume the model is calibrated and use the `roughness` and `minor_loss` 
+    # properties stored on the model. If not, i may need to read in calibration
+    # coefficients from a seperate data source.
+    @classmethod
+    def from_link(
+        cls, 
+        link: wntr.network.Link,
+        model: wntr.network.WaterNetworkModel
+    ):
+        R = 0
+        n_exp = 0
+        assert_msg = f"Link's link_type property doesn't match its type: "
+        "link=\{link} link_type=\{link.link_type}"
+        match link:
+            case wntr.network.Pipe() as pipe:
+                assert(pipe.link_type == "pipe", assert_msg)
+                match model.options.hydraulic.headloss:
+                    case 'H-W':
+                        n_exp = 1.852
+                        R = (
+                            10.67 * pipe.length
+                        ) / (
+                            (
+                                pipe.roughness ** n_exp
+                            ) * (
+                                pipe.diameter ** 4.8704
+                            )
+                        )
+                    case 'D-W', 'C-M':
+                        raise Exception(
+                            f"Support not yet available for headloss formula: "
+                            "\{model.options.hydraulic.headloss}"
+                        )
+                    case _:
+                        raise Exception(
+                            f"Unknown headloss formula: "
+                            "\{model.options.hydraulic.headloss}"
+                        )
+            case wntr.network.Valve() as valve:
+                assert(valve.link_type == "valve", assert_msg)
+                n_exp = 2
+                # `Valve.minor_loss` isn't documented, but its used in the 
+                # `wntr` source for this purpose, so i'm leveraging it here.
+                R = 8.0 * valve.minor_loss / (
+                    9.81 * (math.pi ** 2) * (valve.diameter) ** 4
+                )
+            case wntr.network.Pump() as pump:
+                assert(pump.link_type == "pump", assert_msg)
+                raise Exception(
+                    f"Support not yet available for \{pump.link_type}"
+                )
+            case _:
+                raise Exception(f"Unexpected link_type: \{link.link_type}")
+        return cls(R = R, n_exp = n_exp)
 
 WWMD_ID = NewType('WWMD_ID', str)
 BWFL_ID = NewType('BWFL_ID', str)
@@ -347,3 +411,20 @@ print(incident_matrixes)
 
 z = create_z(model = model)
 print(z)
+
+# flow_initial?
+q_0 = simulation_results.link['flowrate']
+# head_initial?
+h_0 = simulation_results.node['head']
+print(q_0)
+print(h_0)
+
+# TODO: is the `HeadlossCoefficients` struct really a good choice here? 
+# probably better to use a dataframe.
+link_headloss_coefficients = np.zeros(model.num_links, dtype = np.object_)
+for i, (_, link) in enumerate(model.links()):
+    link_headloss_coefficients[i] = HeadlossCoefficients.from_link(
+        link = link, 
+        model = model
+    )
+print(link_headloss_coefficients)

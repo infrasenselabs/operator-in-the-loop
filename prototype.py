@@ -462,6 +462,15 @@ def optimize(
         rule = mass_conservation_constraint
     )
 
+    def objective(model):
+        return (1 / nt) * sum(
+            model.h[i, t] - z[i] 
+            for i in model.I 
+            for t in model.T
+        )
+
+    model.OBJ = pyo.Objective(rule = objective)
+
 
 # flow sensor demand data is in m^3/s and time horizon is a week.
 flow_data_path = Path("data/sample_field_data/flow.csv")

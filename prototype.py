@@ -1,9 +1,12 @@
 from dataclasses import dataclass
 import datetime as dt
 from enum import Enum
+import numpy as np
+from numpy.typing import NDArray
 import json
 import pandas as pd
 from pathlib import Path
+import scipy.sparse as sp
 from typing import Dict, List, Optional, NewType
 import wntr
 
@@ -33,6 +36,10 @@ simulation_results = simulator.run_sim()
 
 # TODO: consider calibration coefficients from Bradley's implementation.
 
+# TODO: more descriptive names for optimization parameters.
+
+# TODO: install MyPy for type checking?
+
 @dataclass
 class SensorReading:
     datetime: dt.datetime
@@ -50,8 +57,50 @@ class SensorReading:
 
 @dataclass
 class OptimizationParameters:
-    h0: pd.Series
+    # reservoir index x datetime
+    h0: pd.DataFrame
+    # datetime x junction
+    d: pd.DataFrame
 
+# TODO: switch to `NDArray[int]` as its more type precise?
+@dataclass
+class IncidentMatrices:
+    # link x junction
+    A12: sp.csr_matrix
+    # link x source
+    A10: sp.csr_matrix
+
+    @classmethod
+    def from_model(cls, model: wntr.network.WaterNetworkModel):
+        link_junction = np.zeros(
+            (model.num_links, model.num_junctions), 
+            dtype = int
+        )
+        link_reservoir = np.zeros(
+            (model.num_links, model.num_reservoirs), 
+            dtype = int
+        )
+        # start node is implies -1 as flow is leaving, end node implies 1 as
+        # flow is entering (flow is from the link's start to end node;
+        # confirmed via EPANET).
+        for i, (_, link) in enumerate(model.links()):
+            for j, (junction_name, _) in enumerate(model.junctions()):
+                if link.start_node_name == junction_name:
+                    link_junction[i, j] = -1
+                elif link.end_node_name == junction_name:
+                    link_junction[i, j] = 1
+            for k, (reservoir_name, _) in enumerate(model.reservoirs()):
+                # TODO: is entering a source actually valid? according to our
+                # slides it is...
+                if link.start_node_name == reservoir_name:
+                    link_reservoir[i, k] = -1
+                elif link.end_node_name == reservoir_name:
+                    link_reservoir[i, k] = 1
+        # store as Compressed Sparse Row matrices to save space.
+        return cls(
+            A12 = sp.csr_matrix(link_junction),
+            A10 = sp.csr_matrix(link_reservoir)
+        )
     
 
 WWMD_ID = NewType('WWMD_ID', str)
@@ -165,10 +214,10 @@ def load_sensor_readings(path: Path) -> List[SensorReading]:
         ).to_dict(orient = "records")
         return [SensorReading(**dictionary) for dictionary in dictionaries]
 
-def create_optimization_parameters(
+def create_h0(
     pressure_readings: List[SensorReading],
     epanet_id_lookup_table: pd.DataFrame
-) -> OptimizationParameters:
+) -> pd.Series:
     # some of these devices aren't in the WMWDs i'm looking at. as an 
     # optimization i should probably remove those and any columnds in don't 
     # need.
@@ -224,15 +273,13 @@ def create_optimization_parameters(
             columns = ["datetime", "mean"]
         ).set_index("datetime")
 
+        # TODO: check this
         head = pressure_head + elevation_head
         # TODO: is there a better way i can align the columns here since they 
         # are equivalent timestamps?
         h0.loc[i] = head["mean"]
     
-    print(h0)
-    return OptimizationParameters(
-        h0 = h0
-    )
+    return h0
 
 # flow sensor demand data is in m^3/s and time horizon is a week.
 flow_data_path = Path("data/sample_field_data/flow.csv")
@@ -270,14 +317,24 @@ reservoir_indexes = epanet_id_lookup_table[
     epanet_id_lookup_table["EPANET Node ID"].isin(model.reservoir_name_list)
 ].index
 
-scale_demands(
+d = scale_demands(
     model_demand_table, 
     flow_map, 
     flow_readings, 
     epanet_id_lookup_table.drop(reservoir_indexes)
 )
 
-create_optimization_parameters(
+h0 = create_h0(
     pressure_readings,
     epanet_id_lookup_table
 )
+
+optimization_parameters = OptimizationParameters(
+    h0 = h0,
+    d = d
+)
+
+print(optimization_parameters)
+
+incident_matrixes = IncidentMatrices.from_model(model = model)
+print(incident_matrixes)
